@@ -295,13 +295,21 @@ func setPayloadProfileArnForAccount(payload *KiroPayload, account *config.Accoun
 }
 
 // endpointsForAccount returns the upstream endpoint list for a credential.
-// API Key accounts always use the CLI runtime protocol; OAuth accounts keep
-// the configured preferred-endpoint fallback chain.
+//
+// 2026-08 起 AWS 把 CodeWhisperer 私有 API（q.us-east-1.amazonaws.com 和
+// codewhisperer.us-east-1.amazonaws.com 上的 generateAssistantResponse）
+// 从 SSO/OAuth 账号的可访问范围里移除，请求会被上游直接截断（体现为
+// "upstream truncated response without stop reason"）。同期 Kiro-CLI 走的
+// runtime.<region>.kiro.dev 对所有账号（API Key + SSO 皆可）都能正常返回，
+// 这也是 kiro-gateway 生产环境上一直在使用的入口。因此把 OAuth/SSO 账号也
+// 强制走 kiroCLIEndpoint。若未来需要为 IDE 类账号回退到旧 endpoints，可以
+// 恢复 getSortedEndpoints(config.GetPreferredEndpoint()) 分支。
 func endpointsForAccount(account *config.Account) []kiroEndpoint {
 	if config.IsAPIKeyAccount(account) {
 		return []kiroEndpoint{kiroCLIEndpoint}
 	}
-	return getSortedEndpoints(config.GetPreferredEndpoint())
+	// SSO/OAuth accounts: same runtime as API Key accounts.
+	return []kiroEndpoint{kiroCLIEndpoint}
 }
 
 // cliRuntimeURL builds the regional Kiro CLI runtime URL.
