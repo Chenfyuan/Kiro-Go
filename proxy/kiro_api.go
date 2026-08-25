@@ -149,21 +149,43 @@ func kiroProfileRegionCandidates(account *config.Account) []string {
 }
 
 // GetUsageLimits 获取账户使用量和订阅信息
+// GetUsageLimits 获取账户使用量和订阅信息。
+//
+// 2026-08 起，旧的 REST 端点 GET codewhisperer.<region>.amazonaws.com/getUsageLimits
+// 对 Kiro POWER 订阅只返回 subscription 元数据、usageBreakdownList 为空
+// （AWS 保留 API shell 但停止填数据）。同期 ListAvailableProfiles 也返回
+// UnknownOperationException，导致 profileArn 无法通过旧的 REST 路径解析。
+// 新端点 POST management.us-east-1.kiro.dev/ + x-amz-target 走 AWS JSON 1.0
+// 协议，能正常返回真实的 currentUsage / usageLimit。响应结构和旧 REST 完全
+// 一致（usageBreakdownList + subscriptionInfo + userInfo），无需改解析。
 func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
 	if err := ensureRestProfileArn(account); err != nil {
 		return nil, fmt.Errorf("resolve profileArn: %w", err)
 	}
+	profileArn := strings.TrimSpace(account.ProfileArn)
+	if profileArn == "" {
+		return nil, fmt.Errorf("resolve profileArn: empty after ensureRestProfileArn")
+	}
 
-	url := fmt.Sprintf("%s/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true", kiroRestAPIBase)
-	url = regionalizeURL(url, account)
-	url = withProfileArnQuery(url, account)
-
-	req, err := http.NewRequest("GET", url, nil)
+	const url = "https://management.us-east-1.kiro.dev/"
+	body := map[string]interface{}{
+		"profileArn":       profileArn,
+		"origin":           "KIRO_CLI",
+		"isEmailRequired":  true,
+	}
+	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
 
+	req, err := http.NewRequest("POST", url, strings.NewReader(string(payload)))
+	if err != nil {
+		return nil, err
+	}
 	setKiroHeaders(req, account)
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	req.Header.Set("X-Amz-Target", "AmazonCodeWhispererService.GetUsageLimits")
+	req.Header.Set("X-Amzn-Codewhisperer-Optout", "true")
 
 	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 	if err != nil {
@@ -172,8 +194,8 @@ func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var result UsageLimitsResponse
@@ -266,6 +288,26 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		return profileArn, nil
 	}
 
+	// 2026-08 起 AWS 的 REST ListAvailableProfiles 已返回 UnknownOperationException
+	// （HTTP 200 但 body 是 coral 错误），resolveProfileArnAcrossRegions 会得到
+	// "empty profile list"、白花几秒钟重试两个 region。SSO refresh 响应仍带
+	// profileArn，所以优先走 refresh，把 REST 探测作为兜底。
+	// external_idp 账号的 refresh 会轮换 refresh_token 且不带 profileArn，
+	// 保留原来的先跳过 refresh、走 REST 的顺序。
+	preferRefresh := account.RefreshToken != "" &&
+		!strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp")
+
+	if preferRefresh {
+		_, _, _, refreshedArn, refreshErr := auth.RefreshToken(account)
+		if refreshErr == nil && refreshedArn != "" {
+			if updateErr := config.UpdateAccountProfileArn(account.ID, refreshedArn); updateErr != nil {
+				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
+			}
+			account.ProfileArn = refreshedArn
+			return refreshedArn, nil
+		}
+	}
+
 	profileLookupSuppressed := isProfileArnResolutionSuppressed(account)
 	var profileUnsupportedErr error
 	var profileUnsupported bool
@@ -285,21 +327,6 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		profileUnsupported = isBuilderIDProfileUnsupportedError(account, err)
 	}
 
-	// AWS refresh responses can include profileArn. Microsoft external_idp
-	// refresh responses do not, and may rotate refresh_token; invoking refresh
-	// here would discard that rotated credential because this resolver only
-	// consumes profileArn.
-	if account.RefreshToken != "" &&
-		!strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp") {
-		_, _, _, refreshedArn, refreshErr := auth.RefreshToken(account)
-		if refreshErr == nil && refreshedArn != "" {
-			if updateErr := config.UpdateAccountProfileArn(account.ID, refreshedArn); updateErr != nil {
-				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
-			}
-			account.ProfileArn = refreshedArn
-			return refreshedArn, nil
-		}
-	}
 	if profileLookupSuppressed {
 		return "", fmt.Errorf("profile ARN resolution skipped: previous Builder ID profile lookup was unsupported")
 	}
