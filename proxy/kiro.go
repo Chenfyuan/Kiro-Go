@@ -409,7 +409,11 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 
 	// Build endpoint list ordered by configuration / credential type.
 	endpoints := resolveKiroEndpoints(account)
+	// 2026-08 起 SSO 账号也强制走 kiroCLIEndpoint（见 endpointsForAccount），
+	// runtime.kiro.dev 只接受 AWS JSON 1.0 协议 + optout=false + 不带 kiro-agent-mode。
+	// useCLIProtocol 兼容 API Key 账号 和 走 kiroCLIEndpoint 的 SSO 账号。
 	isAPIKey := config.IsAPIKeyAccount(account)
+	useCLIProtocol := isAPIKey || (len(endpoints) > 0 && endpoints[0].Name == kiroCLIEndpoint.Name)
 
 	var lastErr error
 endpointLoop:
@@ -418,12 +422,13 @@ endpointLoop:
 		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
 		// Target the profile's data-plane region; endpoint URLs are declared for us-east-1.
-		// API Key accounts use the CLI runtime host instead of IDE/Q hosts.
+		// CLI-protocol accounts (API Key + SSO going through kiroCLIEndpoint) use
+		// the CLI runtime host instead of IDE/Q hosts.
 		epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if isAPIKey {
+		if useCLIProtocol {
 			epURL = cliRuntimeURL(account)
 		}
 
@@ -445,7 +450,7 @@ endpointLoop:
 				lastErr = err
 				continue endpointLoop
 			}
-			if isAPIKey {
+			if useCLIProtocol {
 				req.Header.Set("Content-Type", "application/x-amz-json-1.0")
 			} else {
 				req.Header.Set("Content-Type", "application/json")
@@ -455,11 +460,11 @@ endpointLoop:
 				req.Header.Set("X-Amz-Target", ep.AmzTarget)
 			}
 			applyKiroBaseHeaders(req, account, headerValues)
-			if !isAPIKey {
+			if !useCLIProtocol {
 				req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
 			}
 			// CLI captures use optout=false; IDE path keeps true.
-			if isAPIKey {
+			if useCLIProtocol {
 				req.Header.Set("x-amzn-codewhisperer-optout", "false")
 			} else {
 				req.Header.Set("x-amzn-codewhisperer-optout", "true")
