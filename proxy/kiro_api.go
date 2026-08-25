@@ -288,26 +288,11 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		return profileArn, nil
 	}
 
-	// 2026-08 起 AWS 的 REST ListAvailableProfiles 已返回 UnknownOperationException
-	// （HTTP 200 但 body 是 coral 错误），resolveProfileArnAcrossRegions 会得到
-	// "empty profile list"、白花几秒钟重试两个 region。SSO refresh 响应仍带
-	// profileArn，所以优先走 refresh，把 REST 探测作为兜底。
-	// external_idp 账号的 refresh 会轮换 refresh_token 且不带 profileArn，
-	// 保留原来的先跳过 refresh、走 REST 的顺序。
-	preferRefresh := account.RefreshToken != "" &&
-		!strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp")
-
-	if preferRefresh {
-		_, _, _, refreshedArn, refreshErr := auth.RefreshToken(account)
-		if refreshErr == nil && refreshedArn != "" {
-			if updateErr := config.UpdateAccountProfileArn(account.ID, refreshedArn); updateErr != nil {
-				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
-			}
-			account.ProfileArn = refreshedArn
-			return refreshedArn, nil
-		}
-	}
-
+	// 2026-08 起：旧的 REST ListAvailableProfiles (codewhisperer.<region>.amazonaws.com)
+	// 已被 AWS 下线（返 UnknownOperationException），listKiroProfilesInRegionContext
+	// 已迁移到新的 controlplane：POST management.us-east-1.kiro.dev/。同期实测发现
+	// AWS OIDC refresh 响应不再带 profileArn（只有 accessToken/refreshToken），
+	// 所以 refresh 只作为最后兜底、无法替代 ListAvailableProfiles。
 	profileLookupSuppressed := isProfileArnResolutionSuppressed(account)
 	var profileUnsupportedErr error
 	var profileUnsupported bool
@@ -325,6 +310,20 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		}
 		profileUnsupportedErr = err
 		profileUnsupported = isBuilderIDProfileUnsupportedError(account, err)
+	}
+
+	// AWS refresh 兜底：SSO refresh 响应在某些账号类型下可能带 profileArn；
+	// external_idp 会轮换 refresh_token 且不带 profileArn，跳过。
+	if account.RefreshToken != "" &&
+		!strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp") {
+		_, _, _, refreshedArn, refreshErr := auth.RefreshToken(account)
+		if refreshErr == nil && refreshedArn != "" {
+			if updateErr := config.UpdateAccountProfileArn(account.ID, refreshedArn); updateErr != nil {
+				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
+			}
+			account.ProfileArn = refreshedArn
+			return refreshedArn, nil
+		}
 	}
 
 	if profileLookupSuppressed {
@@ -524,7 +523,14 @@ func listKiroProfilesInRegionContext(
 	if !kiroRegionPattern.MatchString(region) {
 		return nil, fmt.Errorf("invalid Kiro profile region %q", region)
 	}
-	endpoint := regionalizeURLForRegion(fmt.Sprintf("%s/ListAvailableProfiles", kiroRestAPIBase), region)
+	// 2026-08 起旧的 POST codewhisperer.<region>.amazonaws.com/ListAvailableProfiles
+	// 已被 AWS 从 CodeWhisperer coral 服务下线（HTTP 200 但 body 是
+	// UnknownOperationException）。新 endpoint 挪到 kiro controlplane：
+	//   POST management.us-east-1.kiro.dev/
+	//   x-amz-target: AmazonCodeWhispererService.ListAvailableProfiles
+	//   AWS JSON 1.0，maxResults 限制 ≤10
+	// region 参数保留以便未来分区，但目前所有账号都走 us-east-1 控制面。
+	endpoint := "https://management.us-east-1.kiro.dev/"
 	client := GetRestClientForProxy(ResolveAccountProxyURL(account))
 
 	profiles := make([]KiroProfile, 0)
@@ -532,9 +538,9 @@ func listKiroProfilesInRegionContext(
 	invalidCount := 0
 	nextToken := ""
 	// Bound pagination so a misbehaving upstream cannot loop forever. 20 pages
-	// of 50 is far above any realistic Kiro profile count.
+	// of 10 is far above any realistic Kiro profile count.
 	const maxProfilePages = 20
-	const pageSize = 50
+	const pageSize = 10
 	for page := 0; page < maxProfilePages; page++ {
 		requestBody := map[string]interface{}{"maxResults": pageSize}
 		if nextToken != "" {
@@ -549,7 +555,9 @@ func listKiroProfilesInRegionContext(
 			return nil, err
 		}
 		setKiroHeaders(req, account)
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+		req.Header.Set("X-Amz-Target", "AmazonCodeWhispererService.ListAvailableProfiles")
+		req.Header.Set("X-Amzn-Codewhisperer-Optout", "true")
 
 		resp, err := client.Do(req)
 		if err != nil {
